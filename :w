@@ -1,139 +1,144 @@
 use opencv::{
-    core::{Vec3b, CV_32F, CV_32FC1, CV_32FC3, CV_8UC1}, highgui::{self, WINDOW_AUTOSIZE}, prelude::*, types::{VectorOfVec3f, VectorOfi32, VectorOfu8}, videoio, Error, Result
+    core::{Vec3b, CV_32F, CV_32FC1, CV_32FC3, CV_8UC1}, highgui, prelude::*, types::{VectorOfVec3f, VectorOfi32, VectorOfu8}, videoio, Error, Result
 }; // Note, the namespace of OpenCV is changed (to better or worse). It is no longer one enormous.
-use tokio::{sync::mpsc, time::timeout}; // Communicate data
+use tokio::sync::mpsc; // Communicate data
 use tokio::task; // threads
-use std::{borrow::{Borrow, BorrowMut}, f32::consts::{self, PI}, sync::{Arc, Mutex}, time::Duration};
-use image::{imageops::colorops, DynamicImage, GenericImageView, ImageBuffer, Luma, Rgba}; 
+use std::f32::consts::{self, PI};
+use image::{imageops::colorops, DynamicImage, ImageBuffer, Rgba}; 
 
 
-const FRAME_TIMEOUT_DURATION = Duration::from_secs(5); // Adjust timeout duration as needed
+fn process_frame(frame: &mut Mat, normalized_kernel: &Vec<Vec<f32>>) -> Result<(), Error> {
 
-async fn process_frames(receiver: &mut mpsc::Receiver<Arc<tokio::sync::Mutex<Mat>>>, normalized_kernel: &Vec<Vec<f32>>) {
-    println!("IN PROCESS FRAMES");
-    loop {
-    println!("IN PROCESS FRAMES {:#?}", receiver.recv().await);
-        // Attempt to receive a frame from the channel
-        let frame = match receiver.recv().await {
-            Some(frame) => frame,
-            None => {
-                println!("Channel closed or no more frames to receive");
-                break; // Exit the loop if the channel is closed or no more frames to receive
+        let convolve_value_made = create_convolve_value(&frame, &normalized_kernel);
+        if frame.cols() >= 1 && frame.rows() >= 1 {
+            let columns = frame.cols();
+            let rows = frame.rows();
+            create_frame(frame, columns, rows, &convolve_value_made);
+            // Step 4: Iterate over each pixel in the image
+            println!("Grey Frame: {:#?}", frame);
+            highgui::imshow("window", frame)?;
+            let key = highgui::wait_key(1)?;
+            if key == 113 { // quit with q
+                return Err(Error::new(400, "Quit Program"));
             }
-        };
-
-        // Print a message to indicate that a frame has been received
-        println!("Received frame from channel");
-
-        // Lock the frame and perform processing
-        let mut locked_frame = frame.lock().await;
-        // Perform further processing...
-        println!("IN CHANNEL {:#?}", *locked_frame);
-
-
-        let convolve_value_made = create_convolve_value(&locked_frame, &normalized_kernel);
-        let columns = locked_frame.cols();
-        let rows = locked_frame.rows();
-
-        create_frame(&mut locked_frame, columns, rows, &convolve_value_made).await;
-        println!("Rendered Frames: {:#?}", *locked_frame);
-        let _ = highgui::imshow("window", &*locked_frame);
-    }
+        }
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> { // Note, this is anyhow::Result
     let mut cam = videoio::VideoCapture::new(1, videoio::CAP_ANY)?;
     highgui::named_window("window", highgui::WINDOW_FULLSCREEN)?;
 
-    let (sender, mut receiver) = mpsc::channel::<Arc<tokio::sync::Mutex<Mat>>>(1000000);
-    let kernel_size = 5;
+    let (sender, mut receiver) = mpsc::channel::<Mat>(100);
+    let kernel_size = 5; // Or any other odd number
     let sigma = 1000.0;
+
+    // Step 2: Generate Gaussian kernel
     let kernel = generate_gaussian_weight_kernel(kernel_size, sigma);
-    let normalized_kernel = Arc::new(normalize_kernel(&kernel));
+
+    // Step 3: Normalize the kernel
+    let normalized_kernel = normalize_kernel(&kernel);
+
+
+
+    // Spawn the camera task to asynchronously read frames and send them through the channel
+    let camera_task = task::spawn(async move {
+        loop {
+            let mut frame = Mat::default();
+            cam.read(&mut frame);
+
+            if let Err(_) = sender.send(frame).await {
+                break; // Channel closed, terminate the task
+            }
+        }
+    });
 
     // Spawn the processing task to asynchronously receive frames and process them
     let processing_task = task::spawn(async move {
-        println!("Moving reciever");
-        match receiver.recv().await {
-            Some(frame) => {
-                println!("Received frame from channel");
-                // Process the received frame...
-            }
-            None => {
-                println!("Channel closed or no more frames to receive");
-            }
-        }
-        process_frames(&mut receiver, &normalized_kernel).await;
-    });
+        while let Some(frame) = receiver.recv().await {
+            let mut image_frame = frame;
+            let output_image = colorops::grayscale(&mat_to_image(&mut image_frame).expect("Image to grayscale did not work"));    
+            let (width, height) = output_image.dimensions();
+            let mut gray_frame = Mat::new_rows_cols_with_default(height as i32, width as i32, opencv::core::CV_8UC1, opencv::core::Scalar::all(0.0)).unwrap();
+            process_frame(&mut gray_frame, &normalized_kernel);
 
-    // Spawn the camera task to asynchronously read frames and send them through the channel
-    task::spawn(async move {
-        loop {
-            let mut frame = Mat::default();
-            cam.read(&mut frame).expect("Camera frame not put to frame");
-            // Convert the frame to grayscale
-            let grayscale_image = colorops::grayscale(&mat_to_image(&mut frame).expect("Image not grayscale"));
-
-            // Convert the grayscale image to a Mat
-            let grayscale_mat = image_buffer_to_opencv_data(&grayscale_image);
-            println!("{:#?}", grayscale_mat);
-
-            let frame = Arc::new(tokio::sync::Mutex::new(grayscale_mat));
-           
-            if let Err(err) = sender.send(Arc::clone(&frame)).await {
-                    println!("Error sending frame through channel: {}", err);
-                    // Log the error and continue sending frames
-            }  // Use `timeout` to limit the time to read a frame
- timeout(FRAME_TIMEOUT_DURATION, async {
-                let result = cam.read(&mut frame);
-                result
-            })
-            .await
-            .map_err(|_| "Timeout occurred") // Map timeout error to a custom error message
-            .and_then(|result| result) // Unwrap the nested Result
-            {
-                Ok(true) => {
-                    // Frame successfully read from the camera
-                    if let Err(_) = sender.send(frame.clone()).await {
-                        println!("Error sending frame through channel");
-                        break; // Channel closed, terminate the task
-                    }
-                }
-                Ok(false) => {
-                    // Error occurred while reading the frame
-                    println!("Error reading frame from camera");
-                }
-                Err(err) => {
-                    // Timeout occurred
-                    println!("Timeout: No frame received from camera ({})", err);
-                }
-            }
             
         }
     });
 
-    // Wait for the processing task to finish
-    let _ = processing_task.await;
 
+
+
+
+    // Open a GUI window
+    // Open the web-camera (assuming you have one)
+    /* let mut frame = Mat::default(); // This array will store the web-cam data
+    // Read the camera
+    // and display in the window
+
+    let cached_covolution: Vec<Vec<f32>> = Vec::with_capacity(1500 * 1500);
+    
+    // Step 1: Define Gaussian kernel size and sigma
+    let kernel_size = 5; // Or any other odd number
+    let sigma = 1000.0;
+
+    // Step 2: Generate Gaussian kernel
+    let kernel = generate_gaussian_weight_kernel(kernel_size, sigma);
+
+    // Step 3: Normalize the kernel
+    let normalized_kernel = normalize_kernel(&kernel);
+    loop {
+        cam.read(&mut frame)?;
+
+
+
+        let output_image = colorops::grayscale(&mat_to_image(&mut frame)?);    
+
+        let (width, height) = output_image.dimensions();
+        let mut gray_frame = Mat::new_rows_cols_with_default(height as i32, width as i32, opencv::core::CV_8UC1, opencv::core::Scalar::all(0.0)).unwrap();
+        
+        println!("{} {}", width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel_value = output_image.get_pixel(x, y)[0];
+                *gray_frame.at_2d_mut::<u8>(y as i32, x as i32).unwrap() = pixel_value;
+            }
+        }
+
+        println!("Frame: {:#?}", gray_frame);
+         // Iterate through each pixel
+    /* for y in 0..gray_frame.rows() {
+        for x in 0..gray_frame.cols() {
+            // Access the pixel value at (x, y)
+            let pixel_value = *gray_frame.at_2d::<u8>(y, x)?;
+
+            // Print the pixel value (assuming it's a grayscale image)
+            if pixel_value != 0 {
+                                println!("Pixel at ({}, {}): {}", x, y, pixel_value);
+
+                }
+            }
+    } */
+
+
+        let convolve_value_made = create_convolve_value(&gray_frame, &normalized_kernel);
+        if gray_frame.cols() >= 1 && gray_frame.rows() >= 1 {
+            let columns = frame.cols();
+            let rows = frame.rows();
+            create_frame(&mut gray_frame, columns, rows, &convolve_value_made);
+            // Step 4: Iterate over each pixel in the image
+            println!("Grey Frame: {:#?}", gray_frame);
+            highgui::imshow("window", &gray_frame)?;
+            let key = highgui::wait_key(1)?;
+            if key == 113 { // quit with q
+                break;
+            }
+        }
+    } */
     Ok(())
 }
-fn image_buffer_to_opencv_data(image: &ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Mat {
-    // Create a new Mat with the same dimensions as the ImageBuffer
-    let (width, height) = image.dimensions();
-    let mut data = Mat::new_rows_cols_with_default(height as i32, width as i32, opencv::core::CV_8UC1, opencv::core::Scalar::all(0.0)).unwrap();
 
-    // Iterate over each pixel in the ImageBuffer and assign its value to the corresponding position in the Mat
-    for y in 0..height {
-        for x in 0..width {
-            // Get the pixel value at (x, y) from the ImageBuffer
-            let pixel_value = image.get_pixel(x, y)[0];
-            // Assign the pixel value to the corresponding position in the Mat
-            *data.at_2d_mut::<u8>(y as i32, x as i32).unwrap() = pixel_value;
-        }
-    }
-    data
-}
 fn mat_to_image(mat: &mut Mat) -> Result<DynamicImage, Error> {
     if mat.channels() != 3 {
         return Err(Error::new(400, "Image must have three channels to be converted (BGR)"));
